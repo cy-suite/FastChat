@@ -19,7 +19,7 @@ import shortuuid
 
 from fastchat.serve.monitor.basic_stats import get_log_files, NUM_SERVERS
 from fastchat.utils import detect_language
-
+from fastchat.serve.monitor import utils
 
 VOTES = ["tievote", "leftvote", "rightvote", "bothbad_vote"]
 IDENTITY_WORDS = [
@@ -56,6 +56,10 @@ IDENTITY_WORDS = [
     "cohere",
     "DBRX",
     "databricks",
+    "Reka",
+    "Yasa",
+    "snowflake",
+    "arctic",
 ]
 
 ERROR_WORDS = [
@@ -102,6 +106,11 @@ def replace_model_name(old_name, tstamp):
         "StripedHyena-Nous-7B": "stripedhyena-nous-7b",
         "gpt-4-turbo": "gpt-4-1106-preview",
         "gpt-4-0125-assistants-api": "gpt-4-turbo-browsing",
+        "dbrx-instruct": "dbrx-instruct-preview",
+        "reka-flash": "reka-flash-21b-20240226",
+        "reka-flash-online": "reka-flash-21b-20240226-online",
+        "llama-3-70b-chat-hf": "llama-3-70b-instruct",
+        "llama-3-8b-chat-hf": "llama-3-8b-instruct",
     }
     if old_name in ["gpt-4", "gpt-3.5-turbo"]:
         if tstamp > 1687849200:
@@ -258,9 +267,15 @@ def process_data(
         # Replace bard with palm
         models = [replace_model_name(m, row["tstamp"]) for m in models]
         # Exclude certain models
-        if exclude_model_names and any(x in exclude_model_names for x in models):
-            count_dict["exclude_model"] += 1
-            continue
+        if exclude_model_names:
+            exclude = False
+            for exclude_model in exclude_model_names:
+                if exclude_model in models[0] or exclude_model in models[1]:
+                    count_dict["exclude_model"] += 1
+                    exclude = True
+                    break
+            if exclude:
+                continue
 
         question_id = row["states"][0]["conv_id"]
         conversation_a = to_openai_format(
@@ -295,6 +310,25 @@ def process_data(
                 encoding.encode(conv["content"], allowed_special="all")
             )
 
+        user_tokens = sum(
+            [conv["num_tokens"] for conv in conversation_a if conv["role"] == "user"]
+        )
+        context_tokens_a = sum([conv["num_tokens"] for conv in conversation_a[:-1]])
+        context_tokens_b = sum([conv["num_tokens"] for conv in conversation_b[:-1]])
+        num_tokens_info = {
+            "user_tokens": user_tokens,
+            "context_a_tokens": context_tokens_a,
+            "context_b_tokens": context_tokens_b,
+        }
+
+        check_a, _ = utils.check_code_conv(conversation_a)
+        check_b, _ = utils.check_code_conv(conversation_b)
+        is_code = check_a or check_b
+
+        is_refusal_a = utils.contain_refusal(conversation_a)
+        is_refusal_b = utils.contain_refusal(conversation_b)
+        is_refusal = is_refusal_a or is_refusal_b
+
         # Save the results
         battles.append(
             dict(
@@ -309,6 +343,9 @@ def process_data(
                 anony=flag_anony,
                 language=lang_code,
                 tstamp=row["tstamp"],
+                num_tokens_info=num_tokens_info,
+                is_code=is_code,
+                is_refusal=is_refusal,
             )
         )
     return battles, count_dict, count_leak, all_ips
@@ -395,28 +432,29 @@ if __name__ == "__main__":
         last_updated_tstamp, tz=timezone("US/Pacific")
     ).strftime("%Y%m%d")
 
-    if args.mode == "simple":
-        for x in battles:
-            for key in [
-                "conversation_a",
-                "conversation_b",
-                "question_id",
-            ]:
-                del x[key]
-        print("Samples:")
-        for i in range(4):
-            print(battles[i])
-        output = f"clean_battle_{cutoff_date}.json"
-    elif args.mode == "conv_release":
+    if args.mode == "conv_release":
         new_battles = []
         for x in battles:
             if not x["anony"]:
                 continue
-            for key in []:
-                del x[key]
             new_battles.append(x)
-        battles = new_battles
         output = f"clean_battle_conv_{cutoff_date}.json"
+
+        with open(output, "w", encoding="utf-8", errors="replace") as fout:
+            json.dump(new_battles, fout, indent=2, ensure_ascii=False)
+        print(f"Write cleaned data to {output}")
+
+    for x in battles:
+        for key in [
+            "conversation_a",
+            "conversation_b",
+            "question_id",
+        ]:
+            del x[key]
+    print("Samples:")
+    for i in range(4):
+        print(battles[i])
+    output = f"clean_battle_{cutoff_date}.json"
 
     with open(output, "w", encoding="utf-8", errors="replace") as fout:
         json.dump(battles, fout, indent=2, ensure_ascii=False)

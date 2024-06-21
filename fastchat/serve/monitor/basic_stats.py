@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 from tqdm import tqdm
 
 
-NUM_SERVERS = 14
+NUM_SERVERS = 18
 LOG_ROOT_DIR = "~/fastchat_logs"
 
 

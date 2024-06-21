@@ -66,14 +66,19 @@ def compute_elo_mle_with_tie(
         aggfunc="size",
         fill_value=0,
     )
-    ptbl_tie = pd.pivot_table(
-        df[df["winner"].isin(["tie", "tie (bothbad)"])],
-        index="model_a",
-        columns="model_b",
-        aggfunc="size",
-        fill_value=0,
-    )
-    ptbl_tie = ptbl_tie + ptbl_tie.T
+    # if no tie, create a zero matrix
+    if sum(df["winner"].isin(["tie", "tie (bothbad)"])) == 0:
+        ptbl_tie = pd.DataFrame(0, index=ptbl_a_win.index, columns=ptbl_a_win.columns)
+    else:
+        ptbl_tie = pd.pivot_table(
+            df[df["winner"].isin(["tie", "tie (bothbad)"])],
+            index="model_a",
+            columns="model_b",
+            aggfunc="size",
+            fill_value=0,
+        )
+        ptbl_tie = ptbl_tie + ptbl_tie.T
+
     ptbl_b_win = pd.pivot_table(
         df[df["winner"] == "model_b"],
         index="model_a",
@@ -111,7 +116,7 @@ def compute_elo_mle_with_tie(
     X = X[:cur_row]
     Y = Y[:cur_row]
 
-    lr = LogisticRegression(fit_intercept=False, penalty=None)
+    lr = LogisticRegression(fit_intercept=False, penalty=None, tol=1e-6)
     lr.fit(X, Y, sample_weight=sample_weights)
     elo_scores = SCALE * lr.coef_[0] + INIT_RATING
     if "mixtral-8x7b-instruct-v0.1" in models.index:
@@ -275,7 +280,7 @@ def visualize_bootstrap_elo_rating(df, df_final, limit_show_number, scale=1):
         error_y="error_y",
         error_y_minus="error_y_minus",
         text="rating_rounded",
-        height=700,
+        height=500,
         width=700 * scale,
     )
     fig.update_layout(xaxis_title="Model", yaxis_title="Rating")
@@ -400,12 +405,18 @@ def outlier_detect(
 
 
 def filter_long_conv(row):
-    threshold = 768
-    for conversation_type in ["conversation_a", "conversation_b"]:
-        cur_conv = row[conversation_type]
-        num_tokens_all = sum([turn["num_tokens"] for turn in cur_conv])
-        if num_tokens_all >= threshold:
-            return True
+    threshold = 1000
+    if row["num_tokens_info"]["context_a_tokens"] >= threshold:
+        return True
+    if row["num_tokens_info"]["context_b_tokens"] >= threshold:
+        return True
+    return False
+
+
+def filter_long_user_query(row):
+    threshold = 500
+    if row["num_tokens_info"]["user_tokens"] >= threshold:
+        return True
     return False
 
 
@@ -416,6 +427,7 @@ def report_elo_analysis_results(
     exclude_models=[],
     langs=[],
     exclude_tie=False,
+    exclude_bothbad=False,
     exclude_unknown_lang=False,
     daily_vote_per_user=None,
     run_outlier_detect=False,
@@ -448,6 +460,9 @@ def report_elo_analysis_results(
     battles_no_ties = battles[~battles["winner"].str.contains("tie")]
     if exclude_tie:
         battles = battles_no_ties
+    if exclude_bothbad:
+        battles_no_bothbad = battles[~battles["winner"].str.contains("bothbad")]
+        battles = battles_no_bothbad
 
     if daily_vote_per_user is not None:
         battles = limit_user_votes(battles, daily_vote_per_user)
@@ -462,7 +477,9 @@ def report_elo_analysis_results(
 
     if rating_system == "bt":
         bootstrap_df = get_bootstrap_result(
-            battles, compute_elo_mle_with_tie, num_round=num_bootstrap
+            battles,
+            compute_elo_mle_with_tie,
+            num_round=num_bootstrap,
         )
         elo_rating_final = compute_elo_mle_with_tie(battles)
     elif rating_system == "elo":
@@ -577,31 +594,84 @@ if __name__ == "__main__":
         log_files = get_log_files(args.max_num_files)
         battles = clean_battle_data(log_files)
 
-    filter_func_map = {
-        "full": lambda x: True,
-        "long": filter_long_conv,
-        "chinese": lambda x: x["language"] == "Chinese",
-        "english": lambda x: x["language"] == "English",
+    category_config_map = {
+        "full": {
+            "filter_func": lambda x: True,
+        },
+        "full_new": {
+            "filter_func": lambda x: x["num_tokens_info"]["user_tokens"] >= 3,
+        },
+        "long": {
+            "filter_func": filter_long_conv,
+        },
+        "long_user": {
+            "filter_func": filter_long_user_query,
+        },
+        "chinese": {
+            "filter_func": lambda x: x["language"] == "Chinese",
+        },
+        "english": {
+            "filter_func": lambda x: x["language"] == "English",
+        },
+        "english_new": {
+            "filter_func": lambda x: x["language"] == "English"
+            and x["num_tokens_info"]["user_tokens"] >= 3,
+        },
+        "french": {
+            "filter_func": lambda x: x["language"] == "French",
+        },
+        "coding": {
+            "filter_func": lambda x: x["is_code"],
+        },
+        "no_short": {
+            "filter_func": lambda x: x["num_tokens_info"]["user_tokens"] >= 5,
+        },
+        "no_bothbad": {
+            "filter_func": lambda x: True,
+            "exclude_bothbad": True,
+        },
+        "no_tie": {
+            "filter_func": lambda x: True,
+            "exclude_tie": True,
+        },
+        "no_refusal": {
+            "filter_func": lambda x: not x["is_refusal"],
+        },
+        "overall_limit_5_user_vote": {
+            "daily_vote_per_user": 5,
+        },
+        "english_limit_5_user_vote": {
+            "filter_func": lambda x: x["language"] == "English",
+            "daily_vote_per_user": 5,
+        },
     }
     assert all(
-        [cat in filter_func_map for cat in args.category]
+        [cat in category_config_map for cat in args.category]
     ), f"Invalid category: {args.category}"
 
     results = {}
     for cat in args.category:
-        filter_func = filter_func_map[cat]
+        print(f"# Running {cat} conversations")
+        kwargs_default = {
+            "rating_system": args.rating_system,
+            "num_bootstrap": args.num_bootstrap,
+            "exclude_models": args.exclude_models,
+            "langs": args.langs,
+            "exclude_tie": args.exclude_tie,
+            "exclude_unknown_lang": args.exclude_unknown_lang,
+            "daily_vote_per_user": args.daily_vote_per_user,
+            "run_outlier_detect": args.run_outlier_detect,
+            "scale": args.scale,
+            "filter_func": lambda x: True,
+        }
+
+        # overwrite default kwargs with category specific kwargs
+        if cat in category_config_map:
+            kwargs_default.update(category_config_map[cat])
+
         results[cat] = report_elo_analysis_results(
             battles,
-            rating_system=args.rating_system,
-            num_bootstrap=args.num_bootstrap,
-            exclude_models=args.exclude_models,
-            langs=args.langs,
-            exclude_tie=args.exclude_tie,
-            exclude_unknown_lang=args.exclude_unknown_lang,
-            daily_vote_per_user=args.daily_vote_per_user,
-            run_outlier_detect=args.run_outlier_detect,
-            scale=args.scale,
-            filter_func=filter_func,
+            **kwargs_default,
         )
 
     for cat in args.category:
